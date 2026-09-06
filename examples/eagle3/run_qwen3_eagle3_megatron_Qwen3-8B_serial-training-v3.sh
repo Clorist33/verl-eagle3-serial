@@ -195,7 +195,7 @@ CKPTS_DIR=${CKPTS_DIR:-"/home/t00972278/verl/ckpts/${project_name}/${experiment_
 PROFILE_STEPS=${PROFILE_STEPS:-[2]}
 PROFILE_ROLLOUT=${PROFILE_ROLLOUT:-True}
 PROFILE_ACTOR=${PROFILE_ACTOR:-False}
-PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile_eagle3}
+PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile_eagle3/with-stack/gen-tp1-only}
 
 # ===== 指标持久化 =====
 export VERL_FILE_LOGGER_ROOT="/home/t00972278/desk/eagle3_train/eagle3_result/logs/metrics"
@@ -359,6 +359,21 @@ ROLLOUT=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp}
     actor_rollout_ref.rollout.enforce_eager=${ENFORCE_EAGER:-False}
     actor_rollout_ref.rollout.enable_chunked_prefill=True
+    # ---- 直通 vLLM 引擎的两个参数（verl 的 rollout 配置里没有对应字段，
+    #      只能走 engine_kwargs.vllm 透传；已用 --cfg job --resolve 验证过链路）----
+    # draft 侧采样方式：显式写出来只是把 vLLM 的字段默认值固化下来。
+    #   /workspace/vllm/vllm/config/speculative.py:255 本就是 greedy，而
+    #   build_eagle3_speculative_config（vllm_rollout/utils.py:853）从不传这个 key，
+    #   所以此前运行时的实际值已经是 greedy —— **不要期待任何性能变化**。
+    #   写进来是为了：① review 时不必再去 vLLM 源码找默认值；② 将来 vLLM 若改了
+    #   默认值（如升级后变 gumbel），我们的行为不会跟着漂。
+    #   verl-SpeCo 在 vllm_runtime.py:553 同样硬编码 greedy，此项不是两边的差异来源。
+    #   唯一消费点：vllm/v1/worker/gpu/spec_decode/eagle/speculator.py:109
+    # +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.draft_sample_method=${DRAFT_SAMPLE_METHOD:-greedy}
+    # 异步调度：vLLM SchedulerConfig 的字段，默认 None（即不启用）。开启后调度与
+    #   模型前向重叠，可掩盖部分 host 侧调度开销。verl 全仓未涉及此参数，故走透传。
+    #   默认这里给 True —— 若怀疑它引入不稳定，export ASYNC_SCHEDULING=False 关掉。
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=${ASYNC_SCHEDULING:-True}
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len}

@@ -626,9 +626,49 @@ class PPOTrainer(ABC):
             return self._step_once_parallel(metrics, timing_raw, sample_batch_size)
 
     def _is_serial_training_enabled(self) -> bool:
-        """判断是否启用串行训练"""
+        """判断是否启用串行训练。
+
+        两个开关都要为真才走串行路径：
+
+        - ``algorithm.eagle3.enable_serial_training``：选择串行而非并行模式；
+        - ``actor_rollout_ref.model.eagle3.enable_train``：draft 是否参与训练。
+
+        为什么后者也要看：``enable_train=False`` 时 draft 压根没被构建
+        （megatron/transformer_impl.py 的 initialize 里 ``if _e3 is not None and
+        _e3.enable_train`` 不成立 → ``engine._eagle3`` 恒为 None），于是串行路径里
+        那三处 draft 调用全部空转 —— 采集闸门 ``eagle3_collect_only`` 开着也抓不到
+        东西（hidden capture 的 hook 随 setup 一起没装）、``snapshot_draft_teacher``
+        和 ``update_draft_deferred`` 各自在 worker 侧 early-return。结果是白付两次
+        跨进程 RPC，并且每 k 步刷一条 "本步应训 draft，但 worker 没有返回指标" 的
+        警告 —— 那条话术假定"本该训练却失败了"，而实际是配置上就没开，排查时会
+        误导人往采集长度门的方向查。
+
+        所以这里回落到 ``_step_once_parallel``。注意它并不是"并行训 draft"的路径，
+        而是 verl 原有的 PPO 主干（整段不含任何 draft/eagle3 调用）；并行模式下
+        draft 是靠 policy 前向里的 hook 顺带训的，hook 同样由 setup 安装。因此
+        ``enable_train=False`` 下走这条分支，draft 一样不会训，只是更干净。
+
+        eagle3 参与推理不受影响：drafter 在 rollout 侧由
+        ``model.eagle3.enable_rollout`` 独立控制，与本判断无关。
+
+        三个调用点（初始化、路由、metrics）共用本方法，一起回落才自洽：
+        ``_initialize_serial_training_config`` 不执行 → ``actor_steps`` /
+        ``draft_steps`` 等属性不存在 → 串行专用 metrics 也必须同步跳过，否则
+        AttributeError。
+        """
         eagle3_config = self.config.algorithm.get('eagle3', {})
-        return bool(eagle3_config.get('enable_serial_training', False))
+        if not eagle3_config.get('enable_serial_training', False):
+            return False
+
+        model_eagle3 = self.config.actor_rollout_ref.model.get('eagle3', None)
+        enable_train = bool(model_eagle3 is not None and model_eagle3.get('enable_train', False))
+        if not enable_train:
+            logger.warning(
+                "[Serial Training] enable_serial_training=True 但 model.eagle3.enable_train=False："
+                "draft 不参与训练，回落到并行（原版 PPO）主干。eagle3 推理不受影响"
+                "（由 model.eagle3.enable_rollout 控制）。"
+            )
+        return enable_train
 
     def _initialize_serial_training_config(self):
         """初始化串行训练配置（参数验证已在启动前的 validate_config 完成）
@@ -779,8 +819,8 @@ class PPOTrainer(ABC):
             logger.info(f"[Serial Training] Initialized scheduler with k={k}")
 
         # 2. 判断当前步骤类型
-        train_actor = self._serial_scheduler.should_train_actor(self.global_steps)
-        train_draft = self._serial_scheduler.should_train_draft(self.global_steps)
+        train_actor = self._serial_scheduler.should_train_actor(self.global_steps)  # 恒为true
+        train_draft = self._serial_scheduler.should_train_draft(self.global_steps)  # 第k步才是ture
 
         # === 记录当前步骤类型（用于进度条显示）===
         # v3 没有「Draft 步」了：每一步都是 Actor 步，第 k 步额外带上 draft。
@@ -912,8 +952,38 @@ class PPOTrainer(ABC):
                 print(f"draft 的 {self.draft_steps} 训练完成")
                 print("*"*100)
                 print("*"*100)
+            else:
+                # k>1 时 draft 只在 global_steps % k == 0 那些步训练，其余步这些键根本不
+                # 存在，指标行就会时有时无（k=5 时只有 step 5/10/15... 有），画曲线会断。
+                # 这里为未训练的步补 0，让每一步都有值、曲线连续。
+                #
+                # 注意读数时的代价：0 不代表"loss 降到 0"，只代表"本步没训"。
+                # 于是 draft/draft_loss 的曲线会呈锯齿状（k-1 个 0 夹一个真实值），
+                # 跨步求平均也会被 0 拉低到真实值的 1/k 左右。要看真实的 loss 走势，
+                # 请只取非 0 点，或改看 draft/draft_updates>0 的那些步。
+                self._fill_draft_metrics_when_skipped(metrics)
 
         return batch
+
+    # draft 指标的键名，必须与 worker 侧 update_draft_deferred 产出的一致
+    # （engine_workers.py:1025-1032）。加前缀 "draft/" 后与真实训练步同名，
+    # 这样 TensorBoard / jsonl 里是同一条曲线，不会分裂成两条。
+    _DRAFT_METRIC_KEYS = (
+        "draft_loss",
+        "draft_loss_first",
+        "draft_loss_last",
+        "draft_updates",
+        "draft_windows",
+        "draft_time_s",
+    )
+
+    def _fill_draft_metrics_when_skipped(self, metrics: dict) -> None:
+        """未触发 draft 训练的步，把 draft 指标补 0，使每步都有值、曲线连续。
+
+        只填缺失的键：万一将来 draft 指标改由别处写入，这里不会覆盖真实值。
+        """
+        for key in self._DRAFT_METRIC_KEYS:
+            metrics.setdefault(f"draft/{key}", 0.0)
 
     def _update_draft_deferred(self, batch: KVBatchMeta, metrics: dict) -> None:
         """v3：用本步采集的特征训练 draft（在 update_actor 之后调用）。
@@ -930,6 +1000,10 @@ class PPOTrainer(ABC):
                 "或采集根本没有触发。",
                 self.global_steps,
             )
+            # 这一步本该训练却没拿到指标，同样补 0，否则"应训却失败"的步会在曲线上
+            # 留下空洞，和"按 k 跳过"的步混在一起分不清。draft_updates=0 是判据：
+            # 它为 0 说明本步没有任何 optimizer step，无论原因是跳过还是失败。
+            self._fill_draft_metrics_when_skipped(metrics)
             return
 
         from verl.utils.metric import reduce_metrics
@@ -2286,21 +2360,21 @@ TRAINER_REGISTRY: dict[str, type[PPOTrainer]] = {}
 
 
 class SerialTrainingScheduler:
-    """串行训练调度器：决定每个 step 训练 Actor 还是 Draft
+    # """串行训练调度器：决定每个 step 训练 Actor 还是 Draft
 
-    【调度策略】每 k 个 Actor step 后，训练 1 个 Draft step
-    - step 1, 2, ..., k: Actor
-    - step k+1: Draft
-    - step k+2, k+3, ..., 2k+1: Actor
-    - step 2k+2: Draft
-    - ...
+    # 【调度策略】每 k 个 Actor step 后，训练 1 个 Draft step
+    # - step 1, 2, ..., k: Actor
+    # - step k+1: Draft
+    # - step k+2, k+3, ..., 2k+1: Actor
+    # - step 2k+2: Draft
+    # - ...
 
-    示例（k=5）：
-    - step 1,2,3,4,5 → Actor
-    - step 6 → Draft
-    - step 7,8,9,10,11 → Actor
-    - step 12 → Draft
-    """
+    # 示例（k=5）：
+    # - step 1,2,3,4,5 → Actor
+    # - step 6 → Draft
+    # - step 7,8,9,10,11 → Actor
+    # - step 12 → Draft
+    # """
     def __init__(self, k: int = 5):
         """
         Args:

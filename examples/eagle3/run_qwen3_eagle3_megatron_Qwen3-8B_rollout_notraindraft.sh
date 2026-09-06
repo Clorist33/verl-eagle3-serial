@@ -34,7 +34,7 @@
 set -xeuo pipefail
 
 # ===== 关键环境变量必须最先设置 =====
-export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}
+export ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}  #,8,9,10,11,12,13,14,15
 export HCCL_CONNECT_TIMEOUT=1500
 export HCCL_HOST_SOCKET_PORT_RANGE=60000-60500
 export HCCL_NPU_SOCKET_PORT_RANGE=61000-62000
@@ -75,7 +75,7 @@ NPUS_PER_NODE=${NPUS_PER_NODE:-16}
 
 # ===== EAGLE3 draft 训练总开关 =====
 DRAFT_ENABLE_TRAIN=${DRAFT_ENABLE_TRAIN:-False}
-EAGLE3_ENABLE_ROLLOUT=${EAGLE3_ENABLE_ROLLOUT:-False}   # rollout 侧投机解码开启（要看接受率）
+EAGLE3_ENABLE_ROLLOUT=${EAGLE3_ENABLE_ROLLOUT:-True}   # rollout 侧投机解码开启（要看接受率）
 TTT_LENGTH=${TTT_LENGTH:-1}
 
 # ===== V3 串行训练调度 =====
@@ -185,23 +185,17 @@ train_cp=1                      # EAGLE3 门禁：CP 必须为 1
 train_sp=${TRAIN_SP:-True}
 train_ep=1
 train_etp=1
-gen_tp=${GEN_TP:-4}
+gen_tp=${GEN_TP:-1}
 
 project_name=${PROJECT_NAME:-verl_eagle3}
 experiment_name=${EXPERIMENT_NAME:-qwen3_8b_eagle3_serial_v3}
 CKPTS_DIR=${CKPTS_DIR:-"/home/t00972278/verl/ckpts/${project_name}/${experiment_name}"}
 
-# ===== profiling：基线对照也要能采 rollout trace。
-# 要同时采到 vLLM 推理侧，必须 PROFILE_ROLLOUT=True（把 -profiler-config 传给 vLLM）
-# + PROFILE_STEPS 含实际执行的步 + trainer_base 的 llm_server_manager.start/stop_profile 已启用。
-# 默认关（看曲线不看 trace）；要开见下方注释三行。
+# ===== profiling：首轮验证默认关（看曲线不看 trace）；要开设 PROFILE_STEPS="[2,3]" =====
 PROFILE_STEPS=${PROFILE_STEPS:-[2]}
 PROFILE_ROLLOUT=${PROFILE_ROLLOUT:-True}
 PROFILE_ACTOR=${PROFILE_ACTOR:-False}
-PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile_baseline/with-stack/gen-tp1-only}
-# 注意：vLLM 引擎内部 profiler 有 delay_iterations=30，要到第 2 步之后才真正记录，
-# 且 PROFILE_STEPS 决定 do_profile 是否成立。建议 ACTOR_TRAINING_STEPS>=4，
-# 并把 PROFILE_SAVE_PATH 设到单独目录（如 profile_baseline），避免覆盖开投机的 trace。
+PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile_rollout_notrain/with-stack/gen-tp1-only}
 
 # ===== 指标持久化 =====
 export VERL_FILE_LOGGER_ROOT="/home/t00972278/desk/eagle3_train/eagle3_result/logs/metrics"
@@ -336,7 +330,7 @@ ACTOR=(
     actor_rollout_ref.actor.profiler.tool_config.npu.discrete=True
     actor_rollout_ref.actor.profiler.tool_config.npu.contents="['npu','cpu']"
     actor_rollout_ref.actor.profiler.tool_config.npu.level=level1
-    actor_rollout_ref.actor.profiler.tool_config.npu.analysis=False
+    actor_rollout_ref.actor.profiler.tool_config.npu.analysis=True
 )
 
 REF=(
@@ -365,6 +359,21 @@ ROLLOUT=(
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp}
     actor_rollout_ref.rollout.enforce_eager=${ENFORCE_EAGER:-False}
     actor_rollout_ref.rollout.enable_chunked_prefill=True
+    # ---- 直通 vLLM 引擎的两个参数（verl 的 rollout 配置里没有对应字段，
+    #      只能走 engine_kwargs.vllm 透传；已用 --cfg job --resolve 验证过链路）----
+    # draft 侧采样方式：显式写出来只是把 vLLM 的字段默认值固化下来。
+    #   /workspace/vllm/vllm/config/speculative.py:255 本就是 greedy，而
+    #   build_eagle3_speculative_config（vllm_rollout/utils.py:853）从不传这个 key，
+    #   所以此前运行时的实际值已经是 greedy —— **不要期待任何性能变化**。
+    #   写进来是为了：① review 时不必再去 vLLM 源码找默认值；② 将来 vLLM 若改了
+    #   默认值（如升级后变 gumbel），我们的行为不会跟着漂。
+    #   verl-SpeCo 在 vllm_runtime.py:553 同样硬编码 greedy，此项不是两边的差异来源。
+    #   唯一消费点：vllm/v1/worker/gpu/spec_decode/eagle/speculator.py:109
+    # +actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.draft_sample_method=${DRAFT_SAMPLE_METHOD:-greedy}
+    # 异步调度：vLLM SchedulerConfig 的字段，默认 None（即不启用）。开启后调度与
+    #   模型前向重叠，可掩盖部分 host 侧调度开销。verl 全仓未涉及此参数，故走透传。
+    #   默认这里给 True —— 若怀疑它引入不稳定，export ASYNC_SCHEDULING=False 关掉。
+    # +actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=${ASYNC_SCHEDULING:-True}
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${ppo_max_token_len}

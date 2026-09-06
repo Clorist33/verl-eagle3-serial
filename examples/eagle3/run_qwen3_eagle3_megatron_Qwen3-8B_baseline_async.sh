@@ -198,7 +198,7 @@ CKPTS_DIR=${CKPTS_DIR:-"/home/t00972278/verl/ckpts/${project_name}/${experiment_
 PROFILE_STEPS=${PROFILE_STEPS:-[2]}
 PROFILE_ROLLOUT=${PROFILE_ROLLOUT:-True}
 PROFILE_ACTOR=${PROFILE_ACTOR:-False}
-PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-/home/t00972278/desk/eagle3_train/eagle3_result/profile_baseline/with-stack/gen-tp1-only}
+PROFILE_SAVE_PATH=${PROFILE_SAVE_PATH:-//home/t00972278/desk/eagle3_train/eagle3_result/profile_baseline/with-stack/async}
 # 注意：vLLM 引擎内部 profiler 有 delay_iterations=30，要到第 2 步之后才真正记录，
 # 且 PROFILE_STEPS 决定 do_profile 是否成立。建议 ACTOR_TRAINING_STEPS>=4，
 # 并把 PROFILE_SAVE_PATH 设到单独目录（如 profile_baseline），避免覆盖开投机的 trace。
@@ -378,6 +378,7 @@ ROLLOUT=(
     actor_rollout_ref.rollout.profiler.tool_config.npu.contents="['npu','cpu','stack']"
     actor_rollout_ref.rollout.profiler.tool_config.npu.profile_token_start=30
     actor_rollout_ref.rollout.profiler.tool_config.npu.profile_token_end=60
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=${ASYNC_SCHEDULING:-True}
 )
 
 TRAINER=(
